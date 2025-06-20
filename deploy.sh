@@ -11,13 +11,15 @@ IMAGE_TAG=${2:-mtproxy:latest}
 # Function to check if a port is in use
 port_in_use() {
     local port=$1
-    if command -v ss &>/dev/null; then
+    if command -v lsof &>/dev/null; then
+        lsof -i ":${port}" >/dev/null 2>&1
+    elif command -v ss &>/dev/null; then
         ss -tuln | grep -q ":${port} "
     elif command -v netstat &>/dev/null; then
         netstat -tuln | grep -q ":${port} "
     else
         # Fallback: try to bind to the port
-        ! timeout 1 bash -c "</dev/tcp/localhost/${port}" 2>/dev/null
+        (timeout 1 bash -c "exec 3<>/dev/tcp/localhost/${port}" 2>/dev/null && exec 3<&- && exec 3>&-) && return 0 || return 1
     fi
 }
 
@@ -27,12 +29,12 @@ find_available_port() {
     local port=$start_port
     
     while port_in_use "$port"; do
-        echo "Port $port is in use, trying $((port + 1))..."
+        echo "Port $port is in use, trying $((port + 1))..." >&2
         port=$((port + 1))
         
         # Prevent infinite loop
         if [ $port -gt $((start_port + 100)) ]; then
-            echo "Could not find available port in range $start_port-$((start_port + 100))"
+            echo "Could not find available port in range $start_port-$((start_port + 100))" >&2
             exit 1
         fi
     done
@@ -49,9 +51,9 @@ fi
 
 # Determine public IP for invite URL
 if command -v curl &>/dev/null; then
-  PUBLIC_IP=$(curl -s https://api.ipify.org || echo "$(hostname -I | awk '{print $1}')")
+  PUBLIC_IP=$(curl -s https://api.ipify.org || echo "$(hostname -I | awk '{print $1}' 2>/dev/null || echo '127.0.0.1')")
 else
-  PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+  PUBLIC_IP="$(hostname -I | awk '{print $1}' 2>/dev/null || echo '127.0.0.1')"
 fi
 
 echo "Using public IP: $PUBLIC_IP"
@@ -67,18 +69,28 @@ if ! command -v docker &>/dev/null; then
   elif command -v yum &>/dev/null; then
     sudo yum install -y docker
     sudo systemctl enable --now docker
+  elif command -v brew &>/dev/null; then
+    echo "On macOS, please install Docker Desktop from https://www.docker.com/products/docker-desktop/"
+    exit 1
   else
     echo "Cannot install Docker automatically. Please install manually."
     exit 1
   fi
 fi
 
-# Add current user to docker group if not already added
-if ! groups | grep -q docker; then
-  echo "Adding user to docker group..."
-  sudo usermod -aG docker "$USER"
-  echo "Please log out and back in for group changes to take effect, then run this script again."
-  exit 0
+# Skip group management on macOS (Docker Desktop doesn't need it)
+if [[ "$OSTYPE" != "darwin"* ]]; then
+  # Add current user to docker group if not already added
+  if ! groups | grep -q docker; then
+    echo "Adding user to docker group..."
+    if command -v usermod &>/dev/null; then
+      sudo usermod -aG docker "$USER"
+      echo "Please log out and back in for group changes to take effect, then run this script again."
+      exit 0
+    else
+      echo "Warning: Could not add user to docker group. You may need to run docker commands with sudo."
+    fi
+  fi
 fi
 
 echo "Building Docker image..."
