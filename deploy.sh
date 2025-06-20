@@ -8,6 +8,45 @@ set -euo pipefail
 BIND_PORT=${1:-443}
 IMAGE_TAG=${2:-mtproxy:latest}
 
+# Function to check if a port is in use
+port_in_use() {
+    local port=$1
+    if command -v ss &>/dev/null; then
+        ss -tuln | grep -q ":${port} "
+    elif command -v netstat &>/dev/null; then
+        netstat -tuln | grep -q ":${port} "
+    else
+        # Fallback: try to bind to the port
+        ! timeout 1 bash -c "</dev/tcp/localhost/${port}" 2>/dev/null
+    fi
+}
+
+# Find an available port if the default is in use
+find_available_port() {
+    local start_port=$1
+    local port=$start_port
+    
+    while port_in_use "$port"; do
+        echo "Port $port is in use, trying $((port + 1))..."
+        port=$((port + 1))
+        
+        # Prevent infinite loop
+        if [ $port -gt $((start_port + 100)) ]; then
+            echo "Could not find available port in range $start_port-$((start_port + 100))"
+            exit 1
+        fi
+    done
+    
+    echo "$port"
+}
+
+# Check if requested port is available, find alternative if not
+if port_in_use "$BIND_PORT"; then
+    echo "Port $BIND_PORT is already in use."
+    BIND_PORT=$(find_available_port "$BIND_PORT")
+    echo "Using port $BIND_PORT instead."
+fi
+
 # Determine public IP for invite URL
 if command -v curl &>/dev/null; then
   PUBLIC_IP=$(curl -s https://api.ipify.org || echo "$(hostname -I | awk '{print $1}')")
@@ -16,6 +55,7 @@ else
 fi
 
 echo "Using public IP: $PUBLIC_IP"
+echo "Using port: $BIND_PORT"
 
 # Ensure Docker is available
 if ! command -v docker &>/dev/null; then
