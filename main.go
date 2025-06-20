@@ -1,9 +1,9 @@
 package main
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -17,899 +17,467 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/crypto/chacha20"
 )
 
 const (
-	// MTProto constants
-	MTProtoFlag = 0xdddddddd
-	MaxPadding  = 1024
-	MinPadding  = 12
-
-	// Transport types
-	TransportAbridged     = 0xef
-	TransportIntermediate = 0xeeeeeeee
-	TransportPadded       = 0xdddddddd
-	TransportFull         = 0x00000000
-
-	// FakeTLS constants
-	TLSHandshakeType   = 0x16
-	TLSApplicationData = 0x17
-	TLSVersion12       = 0x0303
-	TLSRandomSize      = 32
-	TLSSessionIDSize   = 32
+	// Protocol constants
+	ObfuscatedTag = 0xdddddddd
+	FakeTLSTag    = 0xeeeeeeee
 
 	// Buffer sizes
-	BufferSize     = 64 * 1024
-	MaxConnections = 10000
+	BufferSize = 4096
+
+	// Telegram DCs (UAE optimized)
+	TelegramDC5 = "91.108.56.130:443"   // Singapore (best for UAE)
+	TelegramDC2 = "149.154.167.51:443"  // Amsterdam
+	TelegramDC4 = "149.154.167.91:443"  // Amsterdam
+	TelegramDC1 = "149.154.175.53:443"  // Miami
+	TelegramDC3 = "149.154.175.100:443" // Miami
 )
 
-// Telegram datacenters optimized for UAE region
-var TelegramDatacenters = map[int]DCInfo{
-	1: {ID: 1, IPv4: "149.154.175.53", IPv6: "2001:b28:f23d:f001::a", Location: "MIA", Priority: 3},
-	2: {ID: 2, IPv4: "149.154.167.51", IPv6: "2001:67c:4e8:f002::a", Location: "AMS", Priority: 2},
-	3: {ID: 3, IPv4: "149.154.175.100", IPv6: "2001:b28:f23d:f003::a", Location: "MIA", Priority: 3},
-	4: {ID: 4, IPv4: "149.154.167.91", IPv6: "2001:67c:4e8:f004::a", Location: "AMS", Priority: 2},
-	5: {ID: 5, IPv4: "91.108.56.130", IPv6: "2001:b28:f23f:f005::a", Location: "SIN", Priority: 1}, // Closest to UAE
+// Metrics
+var (
+	connectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "mtproto_connections_total",
+			Help: "Total number of connections",
+		},
+		[]string{"status"},
+	)
+
+	connectionsActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "mtproto_connections_active",
+			Help: "Currently active connections",
+		},
+	)
+
+	bytesTransferred = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "mtproto_bytes_transferred_total",
+			Help: "Total bytes transferred",
+		},
+		[]string{"direction", "datacenter"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(connectionsTotal)
+	prometheus.MustRegister(connectionsActive)
+	prometheus.MustRegister(bytesTransferred)
 }
 
-type DCInfo struct {
-	ID       int
-	IPv4     string
-	IPv6     string
-	Location string
-	Priority int // 1 = closest to UAE, 2 = medium, 3 = farthest
-}
-
+// Secret structure
 type Secret struct {
-	Key  [16]byte
-	Host string
-	Type SecretType
+	Key    []byte
+	Type   byte
+	Domain string
 }
 
-type SecretType int
-
-const (
-	SecretSimple SecretType = iota
-	SecretSecured
-	SecretFakeTLS
-)
-
-type ProxyConfig struct {
-	BindAddr           string
-	Secret             Secret
-	SNIDomain          string
-	DomainFrontingPort int
-	PreferIPv6         bool
-	AntiReplayEnabled  bool
-	MaxConnections     int
-	ConnTimeout        time.Duration
-	BufferSize         int
-}
-
-type MTProtoProxy struct {
-	config          ProxyConfig
-	listener        net.Listener
-	connections     map[string]*ProxyConnection
-	connectionsMux  sync.RWMutex
-	antiReplayCache *AntiReplayCache
-	connectionPool  *ConnectionPool
-	metrics         *ProxyMetrics
-	shutdown        chan bool
-}
-
-type ProxyConnection struct {
-	id           string
-	clientConn   net.Conn
-	telegramConn net.Conn
-	dcID         int
-	transport    TransportType
-	obfuscator   *Obfuscator
-	established  time.Time
-	bytesIn      uint64
-	bytesOut     uint64
-	lastActivity time.Time
-	mutex        sync.RWMutex
-}
-
-type TransportType int
-
-const (
-	TransportTypeAbridged TransportType = iota
-	TransportTypeIntermediate
-	TransportTypePadded
-	TransportTypeFull
-)
-
-type AntiReplayCache struct {
-	cache   map[string]time.Time
-	mutex   sync.RWMutex
-	maxSize int
-	ttl     time.Duration
-}
-
-type ConnectionPool struct {
-	pools map[int]*DCConnectionPool
-	mutex sync.RWMutex
-}
-
-type DCConnectionPool struct {
-	connections chan net.Conn
-	dcInfo      DCInfo
-	mutex       sync.RWMutex
-	active      int
-	maxConn     int
-}
-
-type Obfuscator struct {
-	encryptKey [32]byte
-	encryptIV  [16]byte
-	decryptKey [32]byte
-	decryptIV  [16]byte
-	encoder    cipher.Stream
-	decoder    cipher.Stream
-}
-
-type ProxyMetrics struct {
-	connectionsTotal   prometheus.Counter
-	connectionsActive  prometheus.Gauge
-	bytesTransferred   *prometheus.CounterVec
-	connectionDuration prometheus.Histogram
-	errorCount         *prometheus.CounterVec
-	datacenterConns    *prometheus.GaugeVec
-}
-
-func NewMTProtoProxy(config ProxyConfig) *MTProtoProxy {
-	proxy := &MTProtoProxy{
-		config:          config,
-		connections:     make(map[string]*ProxyConnection),
-		antiReplayCache: NewAntiReplayCache(100000, 5*time.Minute),
-		connectionPool:  NewConnectionPool(),
-		metrics:         NewProxyMetrics(),
-		shutdown:        make(chan bool),
-	}
-
-	// Initialize connection pools for all datacenters
-	for _, dc := range TelegramDatacenters {
-		proxy.connectionPool.InitDC(dc, 10) // 10 connections per DC
-	}
-
-	return proxy
-}
-
-func NewAntiReplayCache(maxSize int, ttl time.Duration) *AntiReplayCache {
-	cache := &AntiReplayCache{
-		cache:   make(map[string]time.Time),
-		maxSize: maxSize,
-		ttl:     ttl,
-	}
-
-	// Start cleanup goroutine
-	go cache.cleanup()
-	return cache
-}
-
-func (c *AntiReplayCache) cleanup() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.mutex.Lock()
-			now := time.Now()
-			for key, timestamp := range c.cache {
-				if now.Sub(timestamp) > c.ttl {
-					delete(c.cache, key)
-				}
-			}
-			c.mutex.Unlock()
-		}
-	}
-}
-
-func (c *AntiReplayCache) CheckAndAdd(data []byte) bool {
-	hash := sha256.Sum256(data)
-	key := hex.EncodeToString(hash[:16]) // Use first 16 bytes as key
-
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	now := time.Now()
-	if timestamp, exists := c.cache[key]; exists {
-		// Check if it's a recent duplicate (within TTL)
-		if now.Sub(timestamp) < c.ttl {
-			return false // Replay attack detected
-		}
-	}
-
-	// Add to cache
-	c.cache[key] = now
-
-	// Cleanup if cache is too large
-	if len(c.cache) > c.maxSize {
-		// Remove oldest entries (simple cleanup)
-		oldest := now
-		oldestKey := ""
-		for k, t := range c.cache {
-			if t.Before(oldest) {
-				oldest = t
-				oldestKey = k
-			}
-		}
-		if oldestKey != "" {
-			delete(c.cache, oldestKey)
-		}
-	}
-
-	return true
-}
-
-func NewConnectionPool() *ConnectionPool {
-	return &ConnectionPool{
-		pools: make(map[int]*DCConnectionPool),
-	}
-}
-
-func (p *ConnectionPool) InitDC(dc DCInfo, maxConn int) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	p.pools[dc.ID] = &DCConnectionPool{
-		connections: make(chan net.Conn, maxConn),
-		dcInfo:      dc,
-		maxConn:     maxConn,
-	}
-}
-
-func (p *ConnectionPool) GetConnection(dcID int) (net.Conn, error) {
-	p.mutex.RLock()
-	pool, exists := p.pools[dcID]
-	p.mutex.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("datacenter %d not found", dcID)
-	}
-
-	// Try to get existing connection from pool
-	select {
-	case conn := <-pool.connections:
-		// Test if connection is still alive
-		conn.SetReadDeadline(time.Now().Add(time.Millisecond))
-		buffer := make([]byte, 1)
-		_, err := conn.Read(buffer)
-		conn.SetReadDeadline(time.Time{})
-
-		if err == nil {
-			// Connection is alive, put the byte back (if possible)
-			return conn, nil
-		}
-		// Connection is dead, close it and create new one
-		conn.Close()
-		return p.createDCConnection(dcID)
-	default:
-		// Create new connection
-		return p.createDCConnection(dcID)
-	}
-}
-
-func (p *ConnectionPool) createDCConnection(dcID int) (net.Conn, error) {
-	p.mutex.RLock()
-	pool, exists := p.pools[dcID]
-	p.mutex.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("datacenter %d not found", dcID)
-	}
-
-	// Prefer IPv6 for better performance in many regions
-	var conn net.Conn
-	var err error
-
-	if pool.dcInfo.IPv6 != "" {
-		conn, err = net.DialTimeout("tcp6", fmt.Sprintf("[%s]:443", pool.dcInfo.IPv6), 10*time.Second)
-		if err != nil && pool.dcInfo.IPv4 != "" {
-			// Fallback to IPv4
-			conn, err = net.DialTimeout("tcp4", fmt.Sprintf("%s:443", pool.dcInfo.IPv4), 10*time.Second)
-		}
-	} else if pool.dcInfo.IPv4 != "" {
-		conn, err = net.DialTimeout("tcp4", fmt.Sprintf("%s:443", pool.dcInfo.IPv4), 10*time.Second)
-	}
-
+// Parse secret from hex string
+func parseSecret(secretHex string) (*Secret, error) {
+	secretBytes, err := hex.DecodeString(secretHex)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to DC %d: %v", dcID, err)
+		return nil, err
 	}
 
-	pool.mutex.Lock()
-	pool.active++
-	pool.mutex.Unlock()
+	if len(secretBytes) < 17 {
+		return nil, fmt.Errorf("secret too short")
+	}
 
-	return conn, nil
+	secret := &Secret{
+		Type: secretBytes[0],
+		Key:  secretBytes[1:17], // 16 bytes key
+	}
+
+	// Extract domain for FakeTLS
+	if secret.Type == 0xee && len(secretBytes) > 17 {
+		secret.Domain = string(secretBytes[17:])
+	}
+
+	return secret, nil
 }
 
-func (p *ConnectionPool) ReturnConnection(dcID int, conn net.Conn) {
-	p.mutex.RLock()
-	pool, exists := p.pools[dcID]
-	p.mutex.RUnlock()
+// Connection represents a client connection
+type Connection struct {
+	client   net.Conn
+	telegram net.Conn
+	secret   *Secret
+	cipher   cipher.Stream
+	decipher cipher.Stream
+}
 
-	if !exists {
-		conn.Close()
+// Initialize encryption for obfuscated connections
+func (c *Connection) initCrypto() error {
+	if c.secret.Type != 0xdd && c.secret.Type != 0xee {
+		return nil // No encryption for simple connections
+	}
+
+	// Create AES cipher
+	block, err := aes.NewCipher(c.secret.Key)
+	if err != nil {
+		return err
+	}
+
+	// Generate random IV
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return err
+	}
+
+	// Initialize CTR mode
+	c.cipher = cipher.NewCTR(block, iv)
+	c.decipher = cipher.NewCTR(block, iv)
+
+	return nil
+}
+
+// Handle client connection
+func (c *Connection) handleConnection() {
+	defer c.client.Close()
+	if c.telegram != nil {
+		defer c.telegram.Close()
+	}
+
+	connectionsActive.Inc()
+	defer connectionsActive.Dec()
+
+	log.Printf("New connection from %s", c.client.RemoteAddr())
+
+	// Initialize crypto if needed
+	if err := c.initCrypto(); err != nil {
+		log.Printf("Failed to initialize crypto: %v", err)
+		connectionsTotal.WithLabelValues("crypto_error").Inc()
 		return
 	}
 
-	select {
-	case pool.connections <- conn:
-		// Successfully returned to pool
+	// Read initial data from client
+	buffer := make([]byte, BufferSize)
+	n, err := c.client.Read(buffer)
+	if err != nil {
+		log.Printf("Failed to read from client: %v", err)
+		connectionsTotal.WithLabelValues("read_error").Inc()
+		return
+	}
+
+	// Handle different protocol types
+	var telegramData []byte
+	switch c.secret.Type {
+	case 0xef: // Simple obfuscated
+		telegramData = c.handleSimpleObfuscated(buffer[:n])
+	case 0xdd: // Secured obfuscated
+		telegramData = c.handleSecuredObfuscated(buffer[:n])
+	case 0xee: // FakeTLS
+		telegramData = c.handleFakeTLS(buffer[:n])
 	default:
-		// Pool is full, close connection
-		conn.Close()
-		pool.mutex.Lock()
-		pool.active--
-		pool.mutex.Unlock()
+		log.Printf("Unknown secret type: %02x", c.secret.Type)
+		connectionsTotal.WithLabelValues("unknown_protocol").Inc()
+		return
 	}
+
+	if telegramData == nil {
+		log.Printf("Failed to process protocol data")
+		connectionsTotal.WithLabelValues("protocol_error").Inc()
+		return
+	}
+
+	// Connect to Telegram
+	if err := c.connectToTelegram(); err != nil {
+		log.Printf("Failed to connect to Telegram: %v", err)
+		connectionsTotal.WithLabelValues("telegram_error").Inc()
+		return
+	}
+
+	// Send initial data to Telegram
+	if _, err := c.telegram.Write(telegramData); err != nil {
+		log.Printf("Failed to write to Telegram: %v", err)
+		connectionsTotal.WithLabelValues("telegram_write_error").Inc()
+		return
+	}
+
+	connectionsTotal.WithLabelValues("success").Inc()
+
+	// Start bidirectional relay
+	c.relay()
 }
 
-func NewObfuscator(secret Secret, initData []byte) (*Obfuscator, error) {
-	obf := &Obfuscator{}
-
-	// Use the provided initialization data for obfuscation
-	if len(initData) < 64 {
-		return nil, fmt.Errorf("initialization data too short")
+// Handle simple obfuscated protocol (0xef)
+func (c *Connection) handleSimpleObfuscated(data []byte) []byte {
+	if len(data) < 64 {
+		return nil
 	}
 
-	// Set up keys from init data and secret
-	keyMaterial := make([]byte, 64)
-	copy(keyMaterial, initData[:32])
-	copy(keyMaterial[32:48], secret.Key[:])
-	copy(keyMaterial[48:], initData[48:64])
-
-	// Generate encryption/decryption keys
-	copy(obf.encryptKey[:], keyMaterial[8:40])
-	copy(obf.decryptKey[:], keyMaterial[8:40])
-
-	// Generate IVs
-	copy(obf.encryptIV[:], keyMaterial[40:56])
-	copy(obf.decryptIV[:], keyMaterial[40:56])
-
-	// Initialize ChaCha20 ciphers for better performance and security
-	var err error
-	obf.encoder, err = chacha20.NewUnauthenticatedCipher(obf.encryptKey[:], obf.encryptIV[:12])
-	if err != nil {
-		return nil, err
-	}
-
-	obf.decoder, err = chacha20.NewUnauthenticatedCipher(obf.decryptKey[:], obf.decryptIV[:12])
-	if err != nil {
-		return nil, err
-	}
-
-	return obf, nil
+	// Simple obfuscated: remove first byte and return MTProto data
+	return data[1:]
 }
 
-func (o *Obfuscator) Encrypt(data []byte) []byte {
-	encrypted := make([]byte, len(data))
-	o.encoder.XORKeyStream(encrypted, data)
-	return encrypted
-}
+// Handle secured obfuscated protocol (0xdd)
+func (c *Connection) handleSecuredObfuscated(data []byte) []byte {
+	if len(data) < 64 {
+		return nil
+	}
 
-func (o *Obfuscator) Decrypt(data []byte) []byte {
+	// Decrypt data using AES-CTR
 	decrypted := make([]byte, len(data))
-	o.decoder.XORKeyStream(decrypted, data)
+	c.decipher.XORKeyStream(decrypted, data)
+
 	return decrypted
 }
 
-func NewProxyMetrics() *ProxyMetrics {
-	return &ProxyMetrics{
-		connectionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mtproto_connections_total",
-			Help: "Total number of connections handled",
-		}),
-		connectionsActive: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "mtproto_connections_active",
-			Help: "Current number of active connections",
-		}),
-		bytesTransferred: prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "mtproto_bytes_transferred_total",
-				Help: "Total bytes transferred",
-			},
-			[]string{"direction", "datacenter"},
-		),
-		connectionDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name: "mtproto_connection_duration_seconds",
-			Help: "Connection duration in seconds",
-		}),
-		errorCount: prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "mtproto_errors_total",
-				Help: "Total number of errors",
-			},
-			[]string{"type"},
-		),
-		datacenterConns: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "mtproto_datacenter_connections",
-				Help: "Active connections per datacenter",
-			},
-			[]string{"datacenter", "location"},
-		),
-	}
-}
-
-func (m *ProxyMetrics) Register() {
-	prometheus.MustRegister(m.connectionsTotal)
-	prometheus.MustRegister(m.connectionsActive)
-	prometheus.MustRegister(m.bytesTransferred)
-	prometheus.MustRegister(m.connectionDuration)
-	prometheus.MustRegister(m.errorCount)
-	prometheus.MustRegister(m.datacenterConns)
-}
-
-func (p *MTProtoProxy) Start() error {
-	var err error
-	p.listener, err = net.Listen("tcp", p.config.BindAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %v", p.config.BindAddr, err)
+// Handle FakeTLS protocol (0xee)
+func (c *Connection) handleFakeTLS(data []byte) []byte {
+	if len(data) < 64 {
+		return nil
 	}
 
-	// Register metrics
-	p.metrics.Register()
+	// For FakeTLS, we need to extract the actual MTProto data
+	// Skip TLS handshake simulation and extract MTProto payload
 
-	// Start metrics server
-	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		server := &http.Server{
-			Addr:    ":8080",
-			Handler: mux,
-		}
-		log.Printf("Metrics server starting on :8080")
-		if err := server.ListenAndServe(); err != nil {
-			log.Printf("Metrics server error: %v", err)
-		}
-	}()
-
-	log.Printf("MTProto proxy listening on %s", p.config.BindAddr)
-	log.Printf("Secret: %x", p.config.Secret.Key)
-	log.Printf("SNI Domain: %s", p.config.SNIDomain)
-	log.Printf("FakeTLS: %v", p.config.Secret.Type == SecretFakeTLS)
-
-	// Print connection URL
-	host := "127.0.0.1"
-	if addr := os.Getenv("ADVERTISED_HOST"); addr != "" {
-		host = addr
-	}
-	port := "443"
-	if _, p, _ := net.SplitHostPort(p.config.BindAddr); p != "" {
-		port = p
-	}
-
-	secretHex := hex.EncodeToString(p.config.Secret.Key[:])
-	if p.config.Secret.Type == SecretFakeTLS {
-		secretHex = "ee" + secretHex + hex.EncodeToString([]byte(p.config.SNIDomain))
-	}
-
-	log.Printf("Telegram URL: tg://proxy?server=%s&port=%s&secret=%s", host, port, secretHex)
-
-	// Accept connections
-	for {
-		select {
-		case <-p.shutdown:
-			return nil
-		default:
-			conn, err := p.listener.Accept()
-			if err != nil {
-				log.Printf("Accept error: %v", err)
-				continue
+	// Look for MTProto marker after TLS headers
+	for i := 0; i < len(data)-4; i++ {
+		if binary.LittleEndian.Uint32(data[i:i+4]) == ObfuscatedTag {
+			// Found MTProto data, decrypt if needed
+			mtprotoData := data[i:]
+			if c.decipher != nil {
+				decrypted := make([]byte, len(mtprotoData))
+				c.decipher.XORKeyStream(decrypted, mtprotoData)
+				return decrypted
 			}
-
-			go p.handleConnection(conn)
-		}
-	}
-}
-
-func (p *MTProtoProxy) handleConnection(clientConn net.Conn) {
-	defer clientConn.Close()
-
-	// Update metrics
-	p.metrics.connectionsTotal.Inc()
-	p.metrics.connectionsActive.Inc()
-	defer p.metrics.connectionsActive.Dec()
-
-	startTime := time.Now()
-	defer func() {
-		duration := time.Since(startTime).Seconds()
-		p.metrics.connectionDuration.Observe(duration)
-	}()
-
-	// Set connection timeout
-	clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-	// Read initial handshake
-	handshake := make([]byte, 64)
-	n, err := io.ReadFull(clientConn, handshake)
-	if err != nil {
-		log.Printf("Failed to read handshake: %v", err)
-		p.metrics.errorCount.WithLabelValues("handshake_read").Inc()
-		return
-	}
-
-	// Remove read deadline after handshake
-	clientConn.SetReadDeadline(time.Time{})
-
-	// Detect protocol and process handshake
-	transport, processed, err := p.processHandshake(handshake[:n])
-	if err != nil {
-		log.Printf("Failed to process handshake: %v", err)
-		p.metrics.errorCount.WithLabelValues("handshake_process").Inc()
-		return
-	}
-
-	// Anti-replay protection
-	if p.config.AntiReplayEnabled && !p.antiReplayCache.CheckAndAdd(handshake[:n]) {
-		log.Printf("Replay attack detected from %s", clientConn.RemoteAddr())
-		p.metrics.errorCount.WithLabelValues("replay_attack").Inc()
-		return
-	}
-
-	// Choose optimal datacenter based on priority (closest to UAE)
-	dcID := p.chooseBestDatacenter()
-
-	// Get connection to Telegram datacenter
-	telegramConn, err := p.connectionPool.GetConnection(dcID)
-	if err != nil {
-		log.Printf("Failed to connect to DC %d: %v", dcID, err)
-		p.metrics.errorCount.WithLabelValues("datacenter_connect").Inc()
-		return
-	}
-	defer func() {
-		p.connectionPool.ReturnConnection(dcID, telegramConn)
-	}()
-
-	// Send processed handshake to Telegram
-	if _, err := telegramConn.Write(processed); err != nil {
-		log.Printf("Failed to send handshake to Telegram: %v", err)
-		p.metrics.errorCount.WithLabelValues("telegram_handshake").Inc()
-		return
-	}
-
-	// Create proxy connection
-	connID := fmt.Sprintf("%s-%d", clientConn.RemoteAddr().String(), time.Now().UnixNano())
-	proxyConn := &ProxyConnection{
-		id:           connID,
-		clientConn:   clientConn,
-		telegramConn: telegramConn,
-		dcID:         dcID,
-		transport:    transport,
-		established:  time.Now(),
-		lastActivity: time.Now(),
-	}
-
-	// Register connection
-	p.connectionsMux.Lock()
-	p.connections[connID] = proxyConn
-	p.connectionsMux.Unlock()
-
-	defer func() {
-		p.connectionsMux.Lock()
-		delete(p.connections, connID)
-		p.connectionsMux.Unlock()
-	}()
-
-	// Update datacenter metrics
-	dc := TelegramDatacenters[dcID]
-	p.metrics.datacenterConns.WithLabelValues(fmt.Sprintf("DC%d", dcID), dc.Location).Inc()
-	defer p.metrics.datacenterConns.WithLabelValues(fmt.Sprintf("DC%d", dcID), dc.Location).Dec()
-
-	log.Printf("New connection %s -> DC%d (%s)", clientConn.RemoteAddr(), dcID, dc.Location)
-
-	// Start bidirectional relay
-	p.relayConnections(proxyConn)
-}
-
-func (p *MTProtoProxy) processHandshake(handshake []byte) (TransportType, []byte, error) {
-	if len(handshake) < 64 {
-		return 0, nil, fmt.Errorf("handshake too short")
-	}
-
-	// Check for FakeTLS
-	if handshake[0] == TLSHandshakeType && len(handshake) >= 3 &&
-		binary.BigEndian.Uint16(handshake[1:3]) == TLSVersion12 {
-
-		// For FakeTLS, we need to extract the encrypted MTProto payload
-		// and send a proper MTProto handshake to Telegram
-		return TransportTypePadded, p.createMTProtoHandshake(), nil
-	}
-
-	// Check for direct MTProto protocols
-	if handshake[0] == 0xef { // Abridged
-		return TransportTypeAbridged, handshake, nil
-	}
-
-	if binary.LittleEndian.Uint32(handshake[0:4]) == TransportIntermediate {
-		return TransportTypeIntermediate, handshake, nil
-	}
-
-	if binary.LittleEndian.Uint32(handshake[0:4]) == TransportPadded {
-		return TransportTypePadded, handshake, nil
-	}
-
-	// Default: assume it's obfuscated and needs to be processed
-	processed := p.processObfuscatedHandshake(handshake)
-	return TransportTypePadded, processed, nil
-}
-
-func (p *MTProtoProxy) createMTProtoHandshake() []byte {
-	// Create a proper MTProto handshake for Telegram servers
-	handshake := make([]byte, 64)
-
-	// Use padded intermediate transport
-	binary.LittleEndian.PutUint32(handshake[0:4], TransportPadded)
-
-	// Add some random data for the rest
-	rand.Read(handshake[4:])
-
-	return handshake
-}
-
-func (p *MTProtoProxy) processObfuscatedHandshake(handshake []byte) []byte {
-	// For obfuscated connections, we process them to extract the real MTProto data
-	processed := make([]byte, len(handshake))
-	copy(processed, handshake)
-
-	// Apply deobfuscation if this looks like an obfuscated connection
-	if p.config.Secret.Type == SecretFakeTLS || p.config.Secret.Type == SecretSecured {
-		// Create temporary obfuscator to decrypt initial data
-		if obf, err := NewObfuscator(p.config.Secret, handshake); err == nil {
-			processed = obf.Decrypt(handshake)
+			return mtprotoData
 		}
 	}
 
-	return processed
-}
-
-func (p *MTProtoProxy) chooseBestDatacenter() int {
-	// For UAE, prioritize Singapore (DC5), then Amsterdam (DC2/DC4), then Miami (DC1/DC3)
-	bestPriority := 999
-	bestDC := 5 // Default to Singapore for UAE
-
-	for dcID, dcInfo := range TelegramDatacenters {
-		if dcInfo.Priority < bestPriority {
-			bestPriority = dcInfo.Priority
-			bestDC = dcID
-		}
+	// If no MTProto marker found, assume the whole payload is encrypted MTProto
+	if c.decipher != nil {
+		decrypted := make([]byte, len(data))
+		c.decipher.XORKeyStream(decrypted, data)
+		return decrypted
 	}
 
-	return bestDC
+	return data
 }
 
-func (p *MTProtoProxy) relayConnections(proxyConn *ProxyConnection) {
+// Connect to Telegram servers (UAE optimized)
+func (c *Connection) connectToTelegram() error {
+	// Try UAE-optimized DCs in order of preference
+	datacenters := []string{
+		TelegramDC5, // Singapore (best for UAE)
+		TelegramDC2, // Amsterdam
+		TelegramDC4, // Amsterdam
+		TelegramDC1, // Miami
+		TelegramDC3, // Miami
+	}
+
+	var lastErr error
+	for _, dc := range datacenters {
+		conn, err := net.DialTimeout("tcp", dc, 10*time.Second)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		c.telegram = conn
+		log.Printf("Connected to Telegram DC: %s", dc)
+		return nil
+	}
+
+	return fmt.Errorf("failed to connect to any Telegram DC: %v", lastErr)
+}
+
+// Relay data between client and Telegram
+func (c *Connection) relay() {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Telegram
+	// Client to Telegram
 	go func() {
 		defer wg.Done()
-		p.relayData(proxyConn.clientConn, proxyConn.telegramConn, proxyConn, "client_to_telegram")
+		c.relayData(c.client, c.telegram, "client_to_telegram")
 	}()
 
-	// Telegram -> Client
+	// Telegram to Client
 	go func() {
 		defer wg.Done()
-		p.relayData(proxyConn.telegramConn, proxyConn.clientConn, proxyConn, "telegram_to_client")
+		c.relayData(c.telegram, c.client, "telegram_to_client")
 	}()
 
 	wg.Wait()
 }
 
-func (p *MTProtoProxy) relayData(src, dst net.Conn, proxyConn *ProxyConnection, direction string) {
+// Relay data in one direction
+func (c *Connection) relayData(src, dst net.Conn, direction string) {
 	buffer := make([]byte, BufferSize)
 
 	for {
-		src.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := src.Read(buffer)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Connection timeout: %s", proxyConn.id)
+			if err != io.EOF {
+				log.Printf("Read error (%s): %v", direction, err)
 			}
 			break
 		}
 
 		data := buffer[:n]
 
-		// For FakeTLS connections, we might need to wrap/unwrap TLS records
-		if p.config.Secret.Type == SecretFakeTLS {
-			if direction == "telegram_to_client" {
-				// Wrap Telegram data in TLS Application Data records
-				data = p.wrapInTLS(data)
-			} else if direction == "client_to_telegram" {
-				// Unwrap TLS records to get MTProto data
-				data = p.unwrapFromTLS(data)
-			}
+		// Apply encryption/decryption if needed
+		if c.cipher != nil && direction == "telegram_to_client" {
+			encrypted := make([]byte, n)
+			c.cipher.XORKeyStream(encrypted, data)
+			data = encrypted
 		}
 
-		// Write data
-		dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err = dst.Write(data)
 		if err != nil {
+			log.Printf("Write error (%s): %v", direction, err)
 			break
 		}
 
-		// Update metrics and connection stats
-		proxyConn.mutex.Lock()
-		if direction == "client_to_telegram" {
-			proxyConn.bytesOut += uint64(len(data))
-		} else {
-			proxyConn.bytesIn += uint64(len(data))
-		}
-		proxyConn.lastActivity = time.Now()
-		proxyConn.mutex.Unlock()
-
-		dc := TelegramDatacenters[proxyConn.dcID]
-		p.metrics.bytesTransferred.WithLabelValues(direction, fmt.Sprintf("DC%d_%s", proxyConn.dcID, dc.Location)).Add(float64(len(data)))
+		// Update metrics
+		bytesTransferred.WithLabelValues(direction, "DC5_SIN").Add(float64(n))
 	}
 }
 
-func (p *MTProtoProxy) wrapInTLS(data []byte) []byte {
-	// Wrap data in TLS Application Data record
-	wrapped := make([]byte, 5+len(data))
-	wrapped[0] = TLSApplicationData
-	binary.BigEndian.PutUint16(wrapped[1:3], TLSVersion12)
-	binary.BigEndian.PutUint16(wrapped[3:5], uint16(len(data)))
-	copy(wrapped[5:], data)
-	return wrapped
+// MTProto Proxy
+type MTProtoProxy struct {
+	secret   *Secret
+	listener net.Listener
 }
 
-func (p *MTProtoProxy) unwrapFromTLS(data []byte) []byte {
-	// Simple TLS unwrapping - in production this would be more sophisticated
-	if len(data) >= 5 && data[0] == TLSApplicationData {
-		recordLen := binary.BigEndian.Uint16(data[3:5])
-		if len(data) >= int(5+recordLen) {
-			return data[5 : 5+recordLen]
-		}
-	}
-	return data
-}
-
-func (p *MTProtoProxy) Stop() error {
-	close(p.shutdown)
-	if p.listener != nil {
-		return p.listener.Close()
-	}
-	return nil
-}
-
-func (p *MTProtoProxy) GetStats() map[string]interface{} {
-	p.connectionsMux.RLock()
-	defer p.connectionsMux.RUnlock()
-
-	stats := map[string]interface{}{
-		"active_connections": len(p.connections),
-		"datacenters":        make(map[string]int),
-		"total_bytes_in":     uint64(0),
-		"total_bytes_out":    uint64(0),
-	}
-
-	dcCounts := make(map[int]int)
-	var totalIn, totalOut uint64
-
-	for _, conn := range p.connections {
-		conn.mutex.RLock()
-		dcCounts[conn.dcID]++
-		totalIn += conn.bytesIn
-		totalOut += conn.bytesOut
-		conn.mutex.RUnlock()
-	}
-
-	for dcID, count := range dcCounts {
-		dc := TelegramDatacenters[dcID]
-		stats["datacenters"].(map[string]int)[fmt.Sprintf("DC%d_%s", dcID, dc.Location)] = count
-	}
-
-	stats["total_bytes_in"] = totalIn
-	stats["total_bytes_out"] = totalOut
-
-	return stats
-}
-
-func parseSecret(secretStr string) (Secret, error) {
-	secret := Secret{Type: SecretSimple}
-
-	if len(secretStr) < 32 {
-		return secret, fmt.Errorf("secret too short")
-	}
-
-	data, err := hex.DecodeString(secretStr)
+// Create new proxy
+func NewMTProtoProxy(secretHex string, bindAddr string) (*MTProtoProxy, error) {
+	secret, err := parseSecret(secretHex)
 	if err != nil {
-		return secret, fmt.Errorf("invalid hex: %v", err)
+		return nil, fmt.Errorf("invalid secret: %v", err)
 	}
 
-	if len(data) < 16 {
-		return secret, fmt.Errorf("secret data too short")
+	listener, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind: %v", err)
 	}
 
-	// Check for FakeTLS prefix
-	if len(data) > 16 && data[0] == 0xee {
-		secret.Type = SecretFakeTLS
-		copy(secret.Key[:], data[1:17])
-		if len(data) > 17 {
-			secret.Host = string(data[17:])
-		}
-	} else if len(data) > 16 && data[0] == 0xdd {
-		secret.Type = SecretSecured
-		copy(secret.Key[:], data[1:17])
-	} else {
-		copy(secret.Key[:], data[:16])
-	}
-
-	return secret, nil
+	return &MTProtoProxy{
+		secret:   secret,
+		listener: listener,
+	}, nil
 }
 
-func generateSecret(sniDomain string) Secret {
-	secret := Secret{
-		Type: SecretFakeTLS,
-		Host: sniDomain,
+// Start proxy
+func (p *MTProtoProxy) Start() error {
+	log.Printf("MTProto proxy listening on %s", p.listener.Addr())
+	log.Printf("Secret type: %02x", p.secret.Type)
+	if p.secret.Domain != "" {
+		log.Printf("FakeTLS domain: %s", p.secret.Domain)
 	}
 
-	// Generate random key
-	if _, err := rand.Read(secret.Key[:]); err != nil {
-		panic(err)
+	for {
+		clientConn, err := p.listener.Accept()
+		if err != nil {
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+
+		// Handle connection in goroutine
+		go func() {
+			conn := &Connection{
+				client: clientConn,
+				secret: p.secret,
+			}
+			conn.handleConnection()
+		}()
+	}
+}
+
+// Generate secret
+func generateSecret(domain string) string {
+	// Generate 16 random bytes for key
+	key := make([]byte, 16)
+	rand.Read(key)
+
+	// Create FakeTLS secret (0xee prefix)
+	secret := append([]byte{0xee}, key...)
+	secret = append(secret, []byte(domain)...)
+
+	return hex.EncodeToString(secret)
+}
+
+// Auto-detect available port
+func findAvailablePort(preferred int) int {
+	for port := preferred; port <= preferred+100; port++ {
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			listener.Close()
+			return port
+		}
+	}
+	return preferred // fallback
+}
+
+// Get external IP
+func getExternalIP() string {
+	resp, err := http.Get("https://ipinfo.io/ip")
+	if err != nil {
+		return "YOUR_SERVER_IP"
+	}
+	defer resp.Body.Close()
+
+	ip, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "YOUR_SERVER_IP"
 	}
 
-	return secret
+	return string(ip)
 }
 
 func main() {
-	// Configuration
-	config := ProxyConfig{
-		BindAddr:           getEnv("BIND_ADDR", ":443"),
-		SNIDomain:          getEnv("SNI_DOMAIN", "google.com"),
-		DomainFrontingPort: 443,
-		PreferIPv6:         true,
-		AntiReplayEnabled:  true,
-		MaxConnections:     MaxConnections,
-		ConnTimeout:        30 * time.Second,
-		BufferSize:         BufferSize,
-	}
-
-	// Parse or generate secret
-	secretStr := os.Getenv("SECRET")
-	if secretStr == "" {
-		config.Secret = generateSecret(config.SNIDomain)
-		log.Printf("Generated new secret: ee%x%x", config.Secret.Key, []byte(config.Secret.Host))
+	// Generate or use existing secret
+	var secret string
+	if len(os.Args) > 1 {
+		secret = os.Args[1]
 	} else {
-		var err error
-		config.Secret, err = parseSecret(secretStr)
-		if err != nil {
-			log.Fatalf("Invalid secret: %v", err)
-		}
+		secret = generateSecret("google.com")
+		log.Printf("Generated new secret: %s", secret)
 	}
 
-	// Create and start proxy
-	proxy := NewMTProtoProxy(config)
+	// Find available port
+	port := findAvailablePort(443)
+	bindAddr := fmt.Sprintf("0.0.0.0:%d", port)
 
-	// Handle graceful shutdown
+	// Create proxy
+	proxy, err := NewMTProtoProxy(secret, bindAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Start metrics server
 	go func() {
-		// You could add signal handling here for graceful shutdown
-		// For now, just run indefinitely
+		http.Handle("/metrics", promhttp.Handler())
+		log.Printf("Metrics server starting on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
 	}()
 
-	log.Printf("Starting MTProto proxy with advanced features:")
-	log.Printf("- Full MTProto 2.0 protocol implementation")
-	log.Printf("- Obfuscated2 and FakeTLS support")
-	log.Printf("- Anti-replay protection: %v", config.AntiReplayEnabled)
-	log.Printf("- UAE-optimized datacenter routing")
-	log.Printf("- Connection multiplexing with pooling")
+	// Print connection info
+	externalIP := getExternalIP()
+	log.Printf("Starting MTProto proxy with:")
+	log.Printf("- Protocol: MTProto 2.0 with obfuscation")
+	log.Printf("- Secret type: %02x", proxy.secret.Type)
+	if proxy.secret.Domain != "" {
+		log.Printf("- FakeTLS domain: %s", proxy.secret.Domain)
+	}
+	log.Printf("- UAE-optimized routing (Singapore DC5 priority)")
 	log.Printf("- Prometheus metrics on :8080/metrics")
 
-	if err := proxy.Start(); err != nil {
-		log.Fatalf("Proxy failed: %v", err)
+	// Generate Telegram URL
+	shortSecret := secret
+	if len(shortSecret) > 34 {
+		shortSecret = shortSecret[:34]
 	}
-}
+	telegramURL := fmt.Sprintf("tg://proxy?server=%s&port=%d&secret=%s",
+		externalIP, port, shortSecret)
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+	log.Printf("Telegram URL: %s", telegramURL)
+
+	// Start proxy
+	log.Fatal(proxy.Start())
 }
