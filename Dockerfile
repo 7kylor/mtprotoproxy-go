@@ -1,17 +1,33 @@
 # syntax=docker/dockerfile:1
 
-# Use official MTG image as source for the binary
-FROM nineseconds/mtg:2 as mtg
+# Build stage
+FROM golang:1.22-alpine AS builder
 
-# Final runtime image  
+WORKDIR /app
+
+# Install git for go modules
+RUN apk add --no-cache git
+
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY main.go ./
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mtproxy .
+
+# Final stage
 FROM gcr.io/distroless/static:latest
 
-# Copy official MTG binary
-COPY --from=mtg /mtg /usr/local/bin/mtg
+# Copy the binary
+COPY --from=builder /app/mtproxy /usr/local/bin/mtproxy
 
 # Run as non-root user
 USER 65534:65534
 
-EXPOSE 3128
+# Expose proxy port and metrics port
+EXPOSE 443 8080
 
-ENTRYPOINT ["/usr/local/bin/mtg"] 
+ENTRYPOINT ["/usr/local/bin/mtproxy"] 

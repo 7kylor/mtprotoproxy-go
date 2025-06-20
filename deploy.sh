@@ -29,58 +29,97 @@ is_port_in_use() {
     if command -v lsof >/dev/null 2>&1; then
         lsof -i :$port >/dev/null 2>&1
     elif command -v ss >/dev/null 2>&1; then
-        ss -ln | grep -q ":$port "
+        ss -tuln | grep ":$port " >/dev/null 2>&1
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -ln | grep -q ":$port "
+        netstat -tuln | grep ":$port " >/dev/null 2>&1
     else
-        return 1  # Cannot check, assume available
+        # Fallback: try to bind to the port
+        if timeout 1 bash -c "</dev/tcp/localhost/$port" 2>/dev/null; then
+            return 0  # Port is in use
+        else
+            return 1  # Port is free
+        fi
     fi
 }
 
 # Find available port starting from 443
 BIND_PORT=443
 while is_port_in_use $BIND_PORT; do
-    echo -e "${YELLOW}Port $BIND_PORT is in use, trying $((BIND_PORT + 1))...${NC}"
+    echo -e "${YELLOW}Port $BIND_PORT is in use, trying $((BIND_PORT + 1))${NC}"
     BIND_PORT=$((BIND_PORT + 1))
-    if [ $BIND_PORT -gt 9999 ]; then
-        echo -e "${RED}Could not find available port${NC}"
+    if [ $BIND_PORT -gt 65535 ]; then
+        echo -e "${RED}No available ports found${NC}"
         exit 1
     fi
 done
 
 echo -e "${GREEN}Using port: $BIND_PORT${NC}"
 
-# Build image
+# Set image tag
 IMAGE_TAG="mtproxy:latest"
-echo "Building Docker image..."
+
+# Stop existing container if running
+if docker ps -q -f name=mtproxy >/dev/null 2>&1; then
+    echo "Stopping existing mtproxy container..."
+    docker stop mtproxy >/dev/null 2>&1 || true
+    docker rm mtproxy >/dev/null 2>&1 || true
+fi
+
+# Build the image
+echo "Building MTProto proxy image..."
 docker build -t "$IMAGE_TAG" .
 
-# Stop existing container
-echo "Stopping existing mtproxy container..."
-docker stop mtproxy 2>/dev/null || true
-docker rm mtproxy 2>/dev/null || true
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Failed to build Docker image${NC}"
+    exit 1
+fi
 
-# Generate secret
-echo "Generating secret..."
-SECRET=$(docker run --rm "$IMAGE_TAG" generate-secret google.com | tail -1)
+echo -e "${GREEN}Image built successfully${NC}"
+
+# Generate or use existing secret
+SECRET=${SECRET:-""}
 
 echo "Starting new mtproxy container..."
 docker run -d \
   --name mtproxy \
   --restart unless-stopped \
-  -p "${BIND_PORT}:3128" \
-  "$IMAGE_TAG" simple-run 0.0.0.0:3128 "$SECRET"
+  -p "${BIND_PORT}:443" \
+  -p "8080:8080" \
+  -e BIND_ADDR=0.0.0.0:443 \
+  -e ADVERTISED_HOST="$PUBLIC_IP" \
+  -e SECRET="$SECRET" \
+  -e SNI_DOMAIN="${SNI_DOMAIN:-google.com}" \
+  "$IMAGE_TAG"
 
 # Show connection URL
 echo "Waiting for proxy to start..."
-sleep 3
+sleep 5
 
-URL="tg://proxy?server=${PUBLIC_IP}&port=${BIND_PORT}&secret=${SECRET}"
-echo -e "${GREEN} MTProto proxy is running!${NC}"
-echo -e "${BLUE}📱 Telegram connection URL:${NC}"
-echo "$URL"
-echo ""
-echo -e "${YELLOW} Management commands:${NC}"
-echo "  docker logs mtproxy     # View logs"
-echo "  docker stop mtproxy     # Stop proxy"
-echo "  docker restart mtproxy  # Restart proxy" 
+# Extract secret and URL from container logs
+SECRET=$(docker logs mtproxy 2>&1 | grep -o "Generated new secret: [a-fA-F0-9]*" | sed 's/Generated new secret: //' | head -1)
+if [ -z "$SECRET" ]; then
+  SECRET=$(docker logs mtproxy 2>&1 | grep -o "Secret: [a-fA-F0-9]*" | sed 's/Secret: //' | head -1)
+fi
+
+if [ -n "$SECRET" ]; then
+  URL="tg://proxy?server=${PUBLIC_IP}&port=${BIND_PORT}&secret=${SECRET}"
+  echo -e "${GREEN} MTProto proxy is running!${NC}"
+  echo -e "${BLUE}Telegram connection URL:${NC}"
+  echo "$URL"
+  echo ""
+  echo -e "${YELLOW} Management commands:${NC}"
+  echo "  docker logs mtproxy         # View logs"
+  echo "  docker stop mtproxy         # Stop proxy"
+  echo "  curl http://localhost:8080/metrics  # View metrics"
+  echo ""
+  echo -e "${BLUE} Advanced Features Active:${NC}"
+  echo "  - Full MTProto 2.0 protocol implementation"
+  echo "  - Obfuscated2 and FakeTLS support"
+  echo "  - Anti-replay protection"
+  echo "  - UAE-optimized datacenter routing (prioritizes Singapore DC5)"
+  echo "  - Connection multiplexing with pooling"
+  echo "  - Prometheus metrics on port 8080"
+else
+  echo -e "${RED}Failed to extract connection details${NC}"
+  echo "Check container logs with: docker logs mtproxy"
+fi 

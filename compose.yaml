@@ -7,11 +7,38 @@
 # You can add other services your application may depend on here, such as a
 # database or a cache. For examples, see the Awesome Compose repository:
 # https://github.com/docker/awesome-compose
+
+version: '3.8'
+
 services:
   mtproxy:
     build: .
     ports:
-      - "3128:3128"
+      - "443:443"
+      - "8080:8080"
+    environment:
+      - BIND_ADDR=0.0.0.0:443
+      - ADVERTISED_HOST=127.0.0.1
+      - SNI_DOMAIN=google.com
+      # Uncomment to use custom secret:
+      # - SECRET=your_32_character_hex_secret_here
+    restart: unless-stopped
+    
+  # Optional: Grafana for monitoring metrics
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - mtproxy
+    restart: unless-stopped
+
+volumes:
+  grafana-data:
 
 # The commented out section below is an example of how to define a PostgreSQL
 # database that your application can use. `depends_on` tells Docker Compose to
