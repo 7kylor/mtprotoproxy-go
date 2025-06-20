@@ -60,27 +60,47 @@ echo "Stopping existing mtproxy container..."
 docker stop mtproxy 2>/dev/null || true
 docker rm mtproxy 2>/dev/null || true
 
-# Generate secret
-echo "Generating secret..."
-SECRET=$(docker run --rm "$IMAGE_TAG" generate-secret google.com | tail -1)
-
 echo "Starting new mtproxy container..."
 docker run -d \
   --name mtproxy \
   --restart unless-stopped \
   -p "${BIND_PORT}:3128" \
-  "$IMAGE_TAG" simple-run 0.0.0.0:3128 "$SECRET"
+  -e MTG_BIND=0.0.0.0:3128 \
+  -e ADVERTISED_HOST="$PUBLIC_IP" \
+  "nineseconds/mtg:2" \
+  simple-run \
+  --prefer-ip=prefer-ipv4 \
+  --doh-ip=91.108.56.130 \
+  0.0.0.0:3128 \
+  $(docker run --rm "nineseconds/mtg:2" generate-secret google.com)
 
 # Show connection URL
 echo "Waiting for proxy to start..."
 sleep 3
 
-URL="tg://proxy?server=${PUBLIC_IP}&port=${BIND_PORT}&secret=${SECRET}"
-echo -e "${GREEN} MTProto proxy is running!${NC}"
-echo -e "${BLUE}📱 Telegram connection URL:${NC}"
-echo "$URL"
-echo ""
-echo -e "${YELLOW} Management commands:${NC}"
-echo "  docker logs mtproxy     # View logs"
-echo "  docker stop mtproxy     # Stop proxy"
-echo "  docker restart mtproxy  # Restart proxy" 
+# Extract secret and URL from container logs  
+SECRET=$(docker logs mtproxy 2>&1 | grep -o "secret=[a-fA-F0-9]*" | sed 's/secret=//' | head -1)
+if [ -z "$SECRET" ]; then
+  # Try to extract from generate-secret output
+  SECRET=$(docker logs mtproxy 2>&1 | grep -o "[a-fA-F0-9]\{32,\}" | head -1)
+fi
+
+if [ -n "$SECRET" ]; then
+  URL="tg://proxy?server=${PUBLIC_IP}&port=${BIND_PORT}&secret=${SECRET}"
+  echo -e "${GREEN} MTProto proxy is running!${NC}"
+  echo -e "${BLUE}Telegram connection URL:${NC}"
+  echo "$URL"
+  echo ""
+  echo -e "${YELLOW} Management commands:${NC}"
+  echo "  docker logs mtproxy     # View logs"
+  echo "  docker stop mtproxy     # Stop proxy"
+  echo "  docker restart mtproxy  # Restart proxy"
+  echo ""
+  echo -e "${BLUE}Singapore Datacenter Optimized:${NC}"
+  echo "  DNS Server: 91.108.56.130 (Telegram DC5 Singapore)"
+  echo "  IP Preference: IPv4 preferred for better routing"
+  echo ""
+else
+  echo -e "${RED}Warning: Could not extract secret from container logs${NC}"
+  echo "Use 'docker logs mtproxy' to check container status"
+fi 

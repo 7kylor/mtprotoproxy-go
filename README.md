@@ -6,6 +6,7 @@ A lightweight, fast, and secure MTProto proxy for Telegram using the official MT
 
 - **Official MTG Binary**: Uses the battle-tested MTG v2 binary for maximum compatibility
 - **FakeTLS Support**: Traffic appears as regular HTTPS traffic to google.com (configurable)
+- **Singapore Datacenter Optimized**: Configured to use Singapore (DC5) for optimal Asia-Pacific routing
 - **Auto-Configuration**: Automatic secret generation and port detection  
 - **Lightweight**: ~6MB Docker image using distroless base
 - **Production Ready**: Includes restart policies and proper security settings
@@ -64,12 +65,30 @@ docker run -d \
 
 ## Configuration
 
+### Singapore Datacenter Optimization
+
+The proxy is configured to optimize routing through Telegram's Singapore datacenter (DC5):
+
+- **DNS Server**: Uses `91.108.56.130` (Telegram DC5 Singapore IP)
+- **IP Preference**: Configured for IPv4 preference for better routing
+- **Geographic Advantage**: Ideal for UAE, Asia-Pacific, and Middle East users
+
+This configuration provides:
+
+- Lower latency for users in the Asia-Pacific region
+- Better routing through Telegram's Singapore infrastructure  
+- Optimal performance for users in UAE, India, Southeast Asia, and nearby regions
+
 ### Environment Variables
 
-The proxy can be configured using the MTG `simple-run` command with the following parameters:
+You can customize the proxy behavior using these environment variables:
 
-- `bind-to`: Address to bind to (default: 0.0.0.0:3128)
-- `secret`: MTProto secret (required)
+```bash
+MTG_BIND=0.0.0.0:3128          # Bind address and port
+ADVERTISED_HOST=your-ip        # Public IP for client connections
+```
+
+## Manual Configuration
 
 ### SNI Domain
 
@@ -82,7 +101,7 @@ docker run --rm mtproxy generate-secret example.com
 Choose domains that are:
 
 - Commonly accessed from your server's location
-- Not blocked in your region
+- Not blocked in your region  
 - Relevant to your hosting provider (e.g., digitalocean.com for DigitalOcean VPS)
 
 ## Management
@@ -126,6 +145,7 @@ This implementation:
 - Runs in a minimal distroless container for security
 - Supports all MTG features including FakeTLS and anti-replay protection
 - Provides automated deployment and management
+- Optimized for Singapore datacenter routing
 
 ## Why MTG?
 
