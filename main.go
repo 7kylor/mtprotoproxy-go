@@ -349,35 +349,27 @@ func (p *ConnectionPool) ReturnConnection(dcID int, conn net.Conn) {
 	}
 }
 
-func NewObfuscator(secret Secret) (*Obfuscator, error) {
+func NewObfuscator(secret Secret, initData []byte) (*Obfuscator, error) {
 	obf := &Obfuscator{}
 
-	// Generate random initialization data
-	initData := make([]byte, 64)
-	if _, err := rand.Read(initData); err != nil {
-		return nil, err
+	// Use the provided initialization data for obfuscation
+	if len(initData) < 64 {
+		return nil, fmt.Errorf("initialization data too short")
 	}
 
-	// Set protocol tag based on secret type
-	switch secret.Type {
-	case SecretFakeTLS:
-		initData[0] = 0xee // FakeTLS tag
-	case SecretSecured:
-		initData[0] = 0xdd // Secured tag
-	default:
-		initData[0] = 0xef // Simple/abridged tag
-	}
+	// Set up keys from init data and secret
+	keyMaterial := make([]byte, 64)
+	copy(keyMaterial, initData[:32])
+	copy(keyMaterial[32:48], secret.Key[:])
+	copy(keyMaterial[48:], initData[48:64])
 
-	// Copy secret to init data
-	copy(initData[8:24], secret.Key[:])
+	// Generate encryption/decryption keys
+	copy(obf.encryptKey[:], keyMaterial[8:40])
+	copy(obf.decryptKey[:], keyMaterial[8:40])
 
-	// Generate encryption/decryption keys using first 32 bytes
-	copy(obf.encryptKey[:], initData[8:40])
-	copy(obf.decryptKey[:], initData[8:40])
-
-	// Generate IVs using bytes 40-56
-	copy(obf.encryptIV[:], initData[40:56])
-	copy(obf.decryptIV[:], initData[40:56])
+	// Generate IVs
+	copy(obf.encryptIV[:], keyMaterial[40:56])
+	copy(obf.decryptIV[:], keyMaterial[40:56])
 
 	// Initialize ChaCha20 ciphers for better performance and security
 	var err error
@@ -545,11 +537,11 @@ func (p *MTProtoProxy) handleConnection(clientConn net.Conn) {
 	// Remove read deadline after handshake
 	clientConn.SetReadDeadline(time.Time{})
 
-	// Determine transport type and create obfuscator
-	transport, obfuscator, err := p.detectTransportAndCreateObfuscator(handshake[:n])
+	// Detect protocol and process handshake
+	transport, processed, err := p.processHandshake(handshake[:n])
 	if err != nil {
-		log.Printf("Failed to detect transport: %v", err)
-		p.metrics.errorCount.WithLabelValues("transport_detection").Inc()
+		log.Printf("Failed to process handshake: %v", err)
+		p.metrics.errorCount.WithLabelValues("handshake_process").Inc()
 		return
 	}
 
@@ -574,6 +566,13 @@ func (p *MTProtoProxy) handleConnection(clientConn net.Conn) {
 		p.connectionPool.ReturnConnection(dcID, telegramConn)
 	}()
 
+	// Send processed handshake to Telegram
+	if _, err := telegramConn.Write(processed); err != nil {
+		log.Printf("Failed to send handshake to Telegram: %v", err)
+		p.metrics.errorCount.WithLabelValues("telegram_handshake").Inc()
+		return
+	}
+
 	// Create proxy connection
 	connID := fmt.Sprintf("%s-%d", clientConn.RemoteAddr().String(), time.Now().UnixNano())
 	proxyConn := &ProxyConnection{
@@ -582,7 +581,6 @@ func (p *MTProtoProxy) handleConnection(clientConn net.Conn) {
 		telegramConn: telegramConn,
 		dcID:         dcID,
 		transport:    transport,
-		obfuscator:   obfuscator,
 		established:  time.Now(),
 		lastActivity: time.Now(),
 	}
@@ -609,7 +607,7 @@ func (p *MTProtoProxy) handleConnection(clientConn net.Conn) {
 	p.relayConnections(proxyConn)
 }
 
-func (p *MTProtoProxy) detectTransportAndCreateObfuscator(handshake []byte) (TransportType, *Obfuscator, error) {
+func (p *MTProtoProxy) processHandshake(handshake []byte) (TransportType, []byte, error) {
 	if len(handshake) < 64 {
 		return 0, nil, fmt.Errorf("handshake too short")
 	}
@@ -618,55 +616,62 @@ func (p *MTProtoProxy) detectTransportAndCreateObfuscator(handshake []byte) (Tra
 	if handshake[0] == TLSHandshakeType && len(handshake) >= 3 &&
 		binary.BigEndian.Uint16(handshake[1:3]) == TLSVersion12 {
 
-		// Extract encrypted handshake from TLS record
-		if len(handshake) < 5 {
-			return 0, nil, fmt.Errorf("invalid TLS record")
-		}
-
-		recordLength := binary.BigEndian.Uint16(handshake[3:5])
-		if len(handshake) < int(5+recordLength) {
-			return 0, nil, fmt.Errorf("incomplete TLS record")
-		}
-
-		// Create obfuscator for FakeTLS
-		obfuscator, err := NewObfuscator(p.config.Secret)
-		if err != nil {
-			return 0, nil, err
-		}
-
-		return TransportTypePadded, obfuscator, nil
+		// For FakeTLS, we need to extract the encrypted MTProto payload
+		// and send a proper MTProto handshake to Telegram
+		return TransportTypePadded, p.createMTProtoHandshake(), nil
 	}
 
-	// Check for obfuscated transport
+	// Check for direct MTProto protocols
 	if handshake[0] == 0xef { // Abridged
-		obfuscator, err := NewObfuscator(p.config.Secret)
-		if err != nil {
-			return 0, nil, err
-		}
-		return TransportTypeAbridged, obfuscator, nil
+		return TransportTypeAbridged, handshake, nil
 	}
 
-	// Check for intermediate transport
 	if binary.LittleEndian.Uint32(handshake[0:4]) == TransportIntermediate {
-		obfuscator, err := NewObfuscator(p.config.Secret)
-		if err != nil {
-			return 0, nil, err
-		}
-		return TransportTypeIntermediate, obfuscator, nil
+		return TransportTypeIntermediate, handshake, nil
 	}
 
-	// Default to padded intermediate
-	obfuscator, err := NewObfuscator(p.config.Secret)
-	if err != nil {
-		return 0, nil, err
+	if binary.LittleEndian.Uint32(handshake[0:4]) == TransportPadded {
+		return TransportTypePadded, handshake, nil
 	}
-	return TransportTypePadded, obfuscator, nil
+
+	// Default: assume it's obfuscated and needs to be processed
+	processed := p.processObfuscatedHandshake(handshake)
+	return TransportTypePadded, processed, nil
+}
+
+func (p *MTProtoProxy) createMTProtoHandshake() []byte {
+	// Create a proper MTProto handshake for Telegram servers
+	handshake := make([]byte, 64)
+
+	// Use padded intermediate transport
+	binary.LittleEndian.PutUint32(handshake[0:4], TransportPadded)
+
+	// Add some random data for the rest
+	rand.Read(handshake[4:])
+
+	return handshake
+}
+
+func (p *MTProtoProxy) processObfuscatedHandshake(handshake []byte) []byte {
+	// For obfuscated connections, we process them to extract the real MTProto data
+	processed := make([]byte, len(handshake))
+	copy(processed, handshake)
+
+	// Apply deobfuscation if this looks like an obfuscated connection
+	if p.config.Secret.Type == SecretFakeTLS || p.config.Secret.Type == SecretSecured {
+		// Create temporary obfuscator to decrypt initial data
+		if obf, err := NewObfuscator(p.config.Secret, handshake); err == nil {
+			processed = obf.Decrypt(handshake)
+		}
+	}
+
+	return processed
 }
 
 func (p *MTProtoProxy) chooseBestDatacenter() int {
 	// For UAE, prioritize Singapore (DC5), then Amsterdam (DC2/DC4), then Miami (DC1/DC3)
 	bestPriority := 999
-	bestDC := 1 // fallback
+	bestDC := 5 // Default to Singapore for UAE
 
 	for dcID, dcInfo := range TelegramDatacenters {
 		if dcInfo.Priority < bestPriority {
@@ -712,12 +717,14 @@ func (p *MTProtoProxy) relayData(src, dst net.Conn, proxyConn *ProxyConnection, 
 
 		data := buffer[:n]
 
-		// Apply obfuscation if configured
-		if proxyConn.obfuscator != nil {
-			if direction == "client_to_telegram" {
-				data = proxyConn.obfuscator.Encrypt(data)
-			} else {
-				data = proxyConn.obfuscator.Decrypt(data)
+		// For FakeTLS connections, we might need to wrap/unwrap TLS records
+		if p.config.Secret.Type == SecretFakeTLS {
+			if direction == "telegram_to_client" {
+				// Wrap Telegram data in TLS Application Data records
+				data = p.wrapInTLS(data)
+			} else if direction == "client_to_telegram" {
+				// Unwrap TLS records to get MTProto data
+				data = p.unwrapFromTLS(data)
 			}
 		}
 
@@ -741,6 +748,27 @@ func (p *MTProtoProxy) relayData(src, dst net.Conn, proxyConn *ProxyConnection, 
 		dc := TelegramDatacenters[proxyConn.dcID]
 		p.metrics.bytesTransferred.WithLabelValues(direction, fmt.Sprintf("DC%d_%s", proxyConn.dcID, dc.Location)).Add(float64(len(data)))
 	}
+}
+
+func (p *MTProtoProxy) wrapInTLS(data []byte) []byte {
+	// Wrap data in TLS Application Data record
+	wrapped := make([]byte, 5+len(data))
+	wrapped[0] = TLSApplicationData
+	binary.BigEndian.PutUint16(wrapped[1:3], TLSVersion12)
+	binary.BigEndian.PutUint16(wrapped[3:5], uint16(len(data)))
+	copy(wrapped[5:], data)
+	return wrapped
+}
+
+func (p *MTProtoProxy) unwrapFromTLS(data []byte) []byte {
+	// Simple TLS unwrapping - in production this would be more sophisticated
+	if len(data) >= 5 && data[0] == TLSApplicationData {
+		recordLen := binary.BigEndian.Uint16(data[3:5])
+		if len(data) >= int(5+recordLen) {
+			return data[5 : 5+recordLen]
+		}
+	}
+	return data
 }
 
 func (p *MTProtoProxy) Stop() error {
