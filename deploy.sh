@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # deploy.sh — build and run the MTProto proxy container on a Linux server
-# Usage: ./deploy.sh <secret> [bind_port] [image_tag]
-#   secret     – MTProto secret in hex or base64 form (required)
+# Usage: ./deploy.sh [bind_port] [image_tag]
 #   bind_port  – Public TCP port to listen on (defaults to 443)
 #   image_tag  – Optional docker tag name (defaults to mtproxy:latest)
 set -euo pipefail
@@ -11,10 +10,12 @@ IMAGE_TAG=${2:-mtproxy:latest}
 
 # Determine public IP for invite URL
 if command -v curl &>/dev/null; then
-  PUBLIC_IP=$(curl -s https://api.ipify.org || true)
+  PUBLIC_IP=$(curl -s https://api.ipify.org || echo "$(hostname -I | awk '{print $1}')")
 else
   PUBLIC_IP="$(hostname -I | awk '{print $1}')"
 fi
+
+echo "Using public IP: $PUBLIC_IP"
 
 # Ensure Docker is available
 if ! command -v docker &>/dev/null; then
@@ -27,20 +28,26 @@ if ! command -v docker &>/dev/null; then
     sudo yum install -y docker
     sudo systemctl enable --now docker
   else
-    echo "Please install Docker manually for your distribution" >&2
+    echo "Cannot install Docker automatically. Please install manually."
     exit 1
   fi
 fi
 
-# Build the image (multi-arch friendly)
-DOCKER_BUILDKIT=1 docker build --platform=linux/amd64 -t "$IMAGE_TAG" .
-
-# Stop old container if running
-if docker ps -a --format '{{.Names}}' | grep -q '^mtproxy$'; then
-  docker rm -f mtproxy
+# Add current user to docker group if not already added
+if ! groups | grep -q docker; then
+  echo "Adding user to docker group..."
+  sudo usermod -aG docker "$USER"
+  echo "Please log out and back in for group changes to take effect, then run this script again."
+  exit 0
 fi
 
-# Run the container
+echo "Building Docker image..."
+docker build -t "$IMAGE_TAG" .
+
+echo "Stopping existing mtproxy container if running..."
+docker rm -f mtproxy 2>/dev/null || true
+
+echo "Starting new mtproxy container..."
 docker run -d \
   --name mtproxy \
   --restart unless-stopped \
@@ -51,7 +58,27 @@ docker run -d \
   "$IMAGE_TAG"
 
 # Show connection URL
-sleep 2
-URL=$(docker logs mtproxy 2>&1 | grep -m1 "Telegram client URL" | sed -E 's/.*URL: //')
+echo "Waiting for proxy to start..."
+sleep 3
 
-echo -e "\nMTProto proxy is up. Connect using:\n${URL}\nPrometheus metrics: http://${PUBLIC_IP}:3129/metrics" 
+# Extract secret and URL from container logs
+SECRET=$(docker logs mtproxy 2>&1 | grep -o "Generated secret: [a-fA-F0-9]*" | sed 's/Generated secret: //' | head -1)
+if [ -z "$SECRET" ]; then
+  SECRET=$(docker logs mtproxy 2>&1 | grep -o "secret=[a-fA-F0-9]*" | sed 's/secret=//' | head -1)
+fi
+
+if [ -n "$SECRET" ]; then
+  URL="tg://proxy?server=${PUBLIC_IP}&port=${BIND_PORT}&secret=${SECRET}"
+  echo -e "\ MTProto proxy is running!"
+  echo -e "\ Telegram connection URL:"
+  echo "$URL"
+  echo -e "\ Prometheus metrics:"
+  echo "http://${PUBLIC_IP}:3129/metrics"
+  echo -e "\n🔧 Management commands:"
+  echo "  docker logs mtproxy     # View logs"
+  echo "  docker stop mtproxy     # Stop proxy"
+  echo "  docker restart mtproxy  # Restart proxy"
+else
+  echo -e "\  Could not extract connection URL. Check logs with:"
+  echo "docker logs mtproxy"
+fi 
